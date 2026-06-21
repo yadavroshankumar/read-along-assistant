@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Read-Along Assistant</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            line-height: 1.8;
+            font-size: 18px;
+            padding: 0 20px;
+        }
+
+        #controls-bar {
+            position: sticky;
+            top: 0;
+            background: white;
+            padding: 15px 0;
+            border-bottom: 1px solid #ddd;
+            z-index: 100;
+        }
+
+        #text-display {
+            margin-top: 30px;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            min-height: 200px;
+        }
+
+        /* Plain text (TXT/DOCX) highlight */
+        /* #text-display span.highlight {
+            background-color: yellow;
+        } */
+        .text-layer span.highlight {
+            background-color: rgba(255, 255, 0, 0.4);
+            color: transparent;
+        }
+
+        /* PDF text layer — invisible spans positioned over the rendered page */
+        .text-layer span {
+            position: absolute;
+            color: transparent;
+            white-space: pre;
+            transform-origin: 0% 0%;
+        }
+        .text-layer span.highlight {
+            background-color: rgba(255, 255, 0, 0.4);
+            color: transparent;
+        }
+
+        button {
+            margin-right: 10px;
+            padding: 8px 16px;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Read-Along Assistant</h1>
+
+    <div id="controls-bar">
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt" />
+        <button id="upload-btn">Upload</button>
+        <br><br>
+        <button id="play-btn" disabled>▶ Play</button>
+        <button id="pause-btn" disabled>⏸ Pause</button>
+        <button id="stop-btn" disabled>⏹ Stop</button>
+    </div>
+
+    <div id="text-display">Upload a document to begin.</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+        let words = [];
+        let utterance = null;
+
+        const fileInput = document.getElementById("file-input");
+        const uploadBtn = document.getElementById("upload-btn");
+        const textDisplay = document.getElementById("text-display");
+        const playBtn = document.getElementById("play-btn");
+        const pauseBtn = document.getElementById("pause-btn");
+        const stopBtn = document.getElementById("stop-btn");
+
+        uploadBtn.addEventListener("click", async () => {
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("Please select a file first.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("file", file);
+
+            textDisplay.innerHTML = "Uploading...";
+
+            const response = await fetch("/upload", {
+                method: "POST",
+                body: formData
+            });
+
+            if (!response.ok) {
+                textDisplay.innerHTML = "Error uploading file.";
+                return;
+            }
+
+            const data = await response.json();
+
+            if (file.name.endsWith(".pdf")) {
+                await renderPdf(data.filename);
+            } else {
+                displayText(data.text);
+            }
+        });
+
+        // ---------- PDF rendering (PDF.js: canvas + word-level text layer) ----------
+
+        async function renderPdf(filename) {
+            textDisplay.innerHTML = '<div id="pdf-container"></div>';
+            const container = document.getElementById("pdf-container");
+
+            const loadingTask = pdfjsLib.getDocument(`/file/${filename}`);
+            const pdf = await loadingTask.promise;
+
+            words = []; // reset global word list
+            let globalWordIndex = 0;
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const viewport = page.getViewport({ scale: 1.5 });
+
+                // Page wrapper — canvas (visual) + text layer (invisible, on top) stacked together
+                const pageDiv = document.createElement("div");
+                pageDiv.style.position = "relative";
+                pageDiv.style.marginBottom = "20px";
+                pageDiv.style.width = `${viewport.width}px`;
+                pageDiv.style.height = `${viewport.height}px`;
+                container.appendChild(pageDiv);
+
+                // 1. Render the visual page onto a canvas
+                const canvas = document.createElement("canvas");
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                pageDiv.appendChild(canvas);
+
+                const renderContext = {
+                    canvasContext: canvas.getContext("2d"),
+                    viewport: viewport
+                };
+                await page.render(renderContext).promise;
+
+                // 2. Build the text layer on top (invisible spans, positioned exactly over each word)
+                const textLayerDiv = document.createElement("div");
+                textLayerDiv.className = "text-layer";
+                textLayerDiv.style.position = "absolute";
+                textLayerDiv.style.top = "0";
+                textLayerDiv.style.left = "0";
+                textLayerDiv.style.width = `${viewport.width}px`;
+                textLayerDiv.style.height = `${viewport.height}px`;
+                pageDiv.appendChild(textLayerDiv);
+
+                const textContent = await page.getTextContent();
+
+                textContent.items.forEach((item) => {
+                    // Each "item" can contain multiple words (a text run) — split into individual words
+                    const itemWords = item.str.split(/\s+/).filter(w => w.length > 0);
+                    if (itemWords.length === 0) return;
+
+                    // Calculate this text item's position and size from its transform matrix
+                    const transform = pdfjsLib.Util.transform(viewport.transform, item.transform);
+                    const fontHeight = Math.hypot(transform[2], transform[3]);
+                    const x = transform[4];
+                    const y = transform[5] - fontHeight;
+                    const itemWidth = item.width * viewport.scale;
+                    const wordWidth = itemWords.length > 0 ? itemWidth / itemWords.length : 0;
+
+                    itemWords.forEach((word, idx) => {
+                        const span = document.createElement("span");
+                        span.id = `word-${globalWordIndex}`;
+                        span.textContent = word;
+                        span.style.left = `${x + (wordWidth * idx)}px`;
+                        span.style.top = `${y}px`;
+                        span.style.fontSize = `${fontHeight}px`;
+                        textLayerDiv.appendChild(span);
+
+                        words.push(word);
+                        globalWordIndex++;
+                    });
+                });
+            }
+
+            playBtn.disabled = false;
+            stopBtn.disabled = false;
+        }
+
+        // ---------- Plain text rendering (TXT / DOCX path) ----------
+
+        function displayText(text) {
+            words = text.split(/\s+/).filter(w => w.length > 0);
+
+            textDisplay.innerHTML = words
+                .map((word, i) => `<span id="word-${i}">${word}</span>`)
+                .join(" ");
+
+            playBtn.disabled = false;
+            stopBtn.disabled = false;
+        }
+
+        // ---------- Playback controls (shared by both paths) ----------
+
+        playBtn.addEventListener("click", () => {
+            const fullText = words.join(" ");
+            utterance = new SpeechSynthesisUtterance(fullText);
+
+            utterance.onboundary = (event) => {
+                if (event.name === "word") {
+                    highlightWordAtCharIndex(event.charIndex, fullText);
+                }
+            };
+
+            utterance.onend = () => {
+                clearHighlights();
+            };
+
+            speechSynthesis.speak(utterance);
+            pauseBtn.disabled = false;
+        });
+
+        pauseBtn.addEventListener("click", () => {
+            if (speechSynthesis.speaking && !speechSynthesis.paused) {
+                speechSynthesis.pause();
+                pauseBtn.textContent = "▶ Resume";
+            } else if (speechSynthesis.paused) {
+                speechSynthesis.resume();
+                pauseBtn.textContent = "⏸ Pause";
+            }
+        });
+
+        stopBtn.addEventListener("click", () => {
+            speechSynthesis.cancel();
+            clearHighlights();
+            pauseBtn.textContent = "⏸ Pause";
+        });
+
+        function highlightWordAtCharIndex(charIndex, fullText) {
+            clearHighlights();
+
+            const textUpToChar = fullText.slice(0, charIndex);
+            const wordIndex = textUpToChar.split(/\s+/).filter(w => w.length > 0).length;
+
+            const span = document.getElementById(`word-${wordIndex}`);
+            if (span) {
+                span.classList.add("highlight");
+                span.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+        }
+
+        function clearHighlights() {
+            document.querySelectorAll(".highlight").forEach(el => el.classList.remove("highlight"));
+        }
+    </script>
+
+</body>
+</html>
